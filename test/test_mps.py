@@ -31,6 +31,7 @@ import torch.backends.mps
 from torch.distributions import Uniform, Exponential
 from torch.utils._python_dispatch import TorchDispatchMode
 from functools import partial
+from torch.nn.attention.flex_attention import flex_attention
 
 from torch.testing._internal.common_methods_invocations import (
     op_db,
@@ -12773,6 +12774,46 @@ class TestMetalLibrary(TestCaseMPS):
                            f"Capture file {capture_dirname} contains only metadata, i.e. {capture_listdir}")
 
 
+class TestFlexAttention(TestCaseMPS):
+    def __init__(self, method_name='runTest'):
+        super().__init__(method_name)
+        B, H, S, D  = 2, 4, 128, 64
+        self.query = torch.randn(B, H, S, D,)
+        self.key = torch.randn(B, H, S, D,)
+        self.value = torch.randn(B, H, S, D,)
+
+    def test_flex_attention_no_score_mod(self):
+        output_cpu = flex_attention(
+            query=self.query,
+            key=self.key,
+            value=self.value,
+        )
+        output_mps = flex_attention(
+            query=self.query.to("mps"),
+            key=self.key.to("mps"),
+            value=self.value.to("mps"),
+        )
+        self.assertEqual(output_cpu, output_mps, rtol=0, atol=1e-5)
+
+    def test_flex_attention_rel_pos(self):
+        def _relative_positional(score, b, h, q_idx, kv_idx):
+            return score + (q_idx - kv_idx)
+
+        output_cpu = flex_attention(
+            query=self.query,
+            key=self.key,
+            value=self.value,
+            score_mod=_relative_positional,
+        )
+        output_mps = flex_attention(
+            query=self.query.to("mps"),
+            key=self.key.to("mps"),
+            value=self.value.to("mps"),
+            score_mod=_relative_positional,
+        )
+        self.assertEqual(output_cpu, output_mps, rtol=0, atol=1e-5)
+
+
 # TODO: Actually instantiate that test for the "mps" device to better reflect what it is doing.
 # This requires mps to be properly registered in the device generic test framework which is not the
 # case right now. We can probably use `allow_mps` introduced in https://github.com/pytorch/pytorch/pull/87342
@@ -12787,6 +12828,7 @@ instantiate_parametrized_tests(TestMPS)
 instantiate_parametrized_tests(TestSDPA)
 instantiate_parametrized_tests(TestSmoothL1Loss)
 instantiate_parametrized_tests(TestMetalLibrary)
+instantiate_parametrized_tests(TestFlexAttention)
 
 if __name__ == "__main__":
     run_tests()

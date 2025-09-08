@@ -1307,9 +1307,13 @@ def _validate_device(query: Tensor, key: Tensor, value: Tensor):
     We only need to check query since we have already that q,k,v are on the same device
     """
     supported_devices = {"cuda", "cpu", "xpu", "hpu"}
+    if not torch.compiler.is_compiling():
+        # Allow "mps" device type if not compiling.
+        supported_devices.add("mps")
+
     if query.device.type not in supported_devices:
         raise ValueError(
-            "FlexAttention is only supported on CUDA, CPU or HPU devices. "
+            "FlexAttention is only supported on CUDA, CPU, HPU, or MPS (in eager mode) devices. "
             f"Found input tensors on {query.device.type} device."
         )
 
