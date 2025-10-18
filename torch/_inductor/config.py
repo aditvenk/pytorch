@@ -199,6 +199,12 @@ online_softmax = os.environ.get("TORCHINDUCTOR_ONLINE_SOFTMAX", "1") == "1"
 # dead code elimination
 dce = False
 
+# Enable experimental MLX Python last-mile codegen for select pointwise kernels.
+mlx_codegen: bool = Config(
+    default=False,
+    env_name_default="TORCH_INDUCTOR_MLX",
+)
+
 # assume weight tensors are fixed size
 static_weight_shapes = True
 

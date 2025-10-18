@@ -1570,7 +1570,10 @@ class _InProcessFxCompile(FxCompile):
                         torch._inductor.debug.log_runtime_and_tensor_meta(node_runtimes)
 
                     # Collect and dump collective-op schedule for external diagnostics
-                    torch._inductor.debug.log_collective_schedule(graph.scheduler.nodes)
+                    if graph.scheduler is not None:
+                        torch._inductor.debug.log_collective_schedule(
+                            graph.scheduler.nodes
+                        )
 
                     if (
                         cudagraphs

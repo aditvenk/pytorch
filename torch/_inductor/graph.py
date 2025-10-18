@@ -2317,6 +2317,9 @@ class GraphLowering(torch.fx.Interpreter):
 
     def codegen(self) -> tuple[ValueWithLineMap, ValueWithLineMap]:
         with dynamo_timed("GraphLowering.codegen", log_pt2_compile_event=True):
+            if config.mlx_codegen:
+                return self._codegen_mlx()
+
             self.init_wrapper_code()
 
             self._update_scheduler()
@@ -2333,6 +2336,14 @@ class GraphLowering(torch.fx.Interpreter):
             result = self.wrapper_code.generate(self.is_inference)
             self.wrapper_code.pop_codegened_graph()
             return result
+
+    def _codegen_mlx(self) -> tuple[ValueWithLineMap, ValueWithLineMap]:
+        from .codegen.mlx import MLXGraphCodegen
+
+        builder = MLXGraphCodegen(self)
+        wrapper_code = builder.generate()
+        empty = ValueWithLineMap("", [])
+        return wrapper_code, empty
 
     def codegen_subgraph(self, parent_graph: GraphLowering) -> None:
         """
