@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch._inductor import config
+from torch._inductor import codecache, config, exc as inductor_exc
+import torch._dynamo.config as dynamo_config
+from torch._inductor.compile_fx import compile_fx
+from unittest import mock
 
 import pytest
 
@@ -15,6 +18,16 @@ pytestmark = pytest.mark.skipif(
     MLX_IMPORT_ERROR is not None,
     reason=f"mlx.core unavailable: {MLX_IMPORT_ERROR}",
 )
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["static_shapes", "dynamic_shapes"])
+def _toggle_dynamic_shapes(request):
+    prev_dynamic = dynamo_config.dynamic_shapes
+    dynamo_config.dynamic_shapes = request.param
+    try:
+        yield
+    finally:
+        dynamo_config.dynamic_shapes = prev_dynamic
 def test_mlx_backend_torch_compile_matches_eager():
     x = torch.randn(16, 16)
     y = torch.randn(16, 16)
@@ -362,6 +375,116 @@ def test_mlx_backend_cat_default():
     torch.testing.assert_close(compiled_out, eager)
 
 
+def test_mlx_backend_add_tensor_with_alpha():
+    torch.manual_seed(10)
+    x = torch.randn(7, 3)
+    y = torch.randn(7, 3)
+
+    def fn(a, b):
+        return torch.add(a, b, alpha=0.5)
+
+    eager = fn(x, y)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x, y)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_add_scalar():
+    torch.manual_seed(11)
+    x = torch.randn(4, 5)
+
+    def fn(a):
+        return torch.add(a, 2.5)
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_python_add_scalar_tensor():
+    torch.manual_seed(11)
+    x = torch.randn(2, 3)
+
+    def fn(a):
+        return (a + 1.25, 2.0 + a)
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_symbolic_shape_full():
+    torch.manual_seed(12)
+    class SymShapeNet(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            seq = x.shape[1]
+            filled = torch.full((seq, 1), 1.0, dtype=x.dtype, device=x.device)
+            return filled.reshape(seq, 1)
+
+    model = SymShapeNet()
+    inputs = torch.randn(2, 5)
+    eager = model(inputs)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(model, backend="inductor", fullgraph=True)
+        compiled_out = compiled(inputs)
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_symbolic_iota():
+    torch.manual_seed(13)
+    class MaskNet(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            seq = x.shape[1]
+            mask = torch.arange(seq, device=x.device)
+            return mask.to(x.dtype)
+
+    model = MaskNet()
+    inputs = torch.randn(1, 7)
+    eager = model(inputs)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(model, backend="inductor", fullgraph=True)
+        compiled_out = compiled(inputs)
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_sym_sum_fx_graph():
+    torch.manual_seed(14)
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    sym = graph.call_function(torch.ops.aten.sym_size.int, args=(x, 1))
+    sym_sum = graph.call_function(torch.sym_sum, args=((1, sym),))
+    full = graph.call_function(
+        torch.ops.aten.full.default,
+        args=([sym_sum], 0.0),
+        kwargs={
+            "dtype": torch.float32,
+            "device": torch.device("cpu"),
+            "layout": torch.strided,
+            "pin_memory": False,
+        },
+    )
+    graph.output(full)
+
+    module = torch.fx.GraphModule(torch.nn.Module(), graph)
+    inputs = (torch.randn(1, 4),)
+    eager = module(*inputs)
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = compile_fx(module, inputs)
+        compiled_out = compiled(*inputs)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
 def test_mlx_backend_cos_default():
     torch.manual_seed(11)
     x = torch.randn(6, 6)
@@ -409,6 +532,23 @@ def test_mlx_backend_index_tensor():
     torch.testing.assert_close(compiled_out, eager)
 
 
+def test_mlx_backend_index_multi_tensor():
+    torch.manual_seed(14)
+    data = torch.randn(4, 6, 2)
+    row_idx = torch.tensor([[0], [3]], dtype=torch.long)
+    col_idx = torch.tensor([[1, 4, 2]], dtype=torch.long)
+
+    def fn(x, r, c):
+        return x[r, c]
+
+    eager = fn(data, row_idx, col_idx)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(data, row_idx, col_idx)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
 def test_mlx_backend_pow_tensor_scalar():
     torch.manual_seed(16)
     x = torch.rand(4, 4).clamp_min(1e-3)
@@ -437,6 +577,33 @@ def test_mlx_backend_slice_tensor():
         compiled_out = compiled(x)
 
     torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_slice_tensor_dynamic_resize():
+    if not dynamo_config.dynamic_shapes:
+        pytest.skip("dynamic shapes required")
+
+    torch.manual_seed(170)
+
+    def fn(t):
+        return t[:, :, :, 48:]
+
+    short = torch.randn(1, 2, 15, 96)
+    long = torch.randn(1, 2, 16, 96)
+
+    def _disable_cpp(*_args, **_kwargs):
+        raise inductor_exc.InvalidCxxCompiler()
+
+    with config.patch({"mlx_codegen": True}):
+        with mock.patch.object(codecache.CppCodeCache, "load", side_effect=_disable_cpp), mock.patch.object(
+            codecache.CppCodeCache, "load_async", side_effect=_disable_cpp
+        ):
+            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+            short_out = compiled(short)
+            long_out = compiled(long)
+
+    torch.testing.assert_close(short_out, fn(short))
+    torch.testing.assert_close(long_out, fn(long))
 
 
 def test_mlx_backend_prims_convert_element_type():

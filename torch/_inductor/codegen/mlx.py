@@ -80,6 +80,9 @@ _TORCH_DTYPE_TO_MX = {
 }
 
 
+_INT64_MAX = 2**63 - 1
+
+
 def _torch_dtype_to_mx(dtype: torch.dtype) -> str:
     mx_dtype = _TORCH_DTYPE_TO_MX.get(dtype)
     if mx_dtype is None:
@@ -159,12 +162,13 @@ class MLXGraphCodegen:
                     "tensor = value",
                     "if not tensor.is_contiguous():",
                     "    tensor = tensor.contiguous()",
-                    "if hasattr(tensor, 'device') and tensor.device.type != 'cpu':",
-                    "    try:",
-                    "        return mx.array(_dlpack.to_dlpack(tensor))",
-                    "    except Exception:",
-                    "        pass",
+                    "try:",
+                    "    return mx.array(_dlpack.to_dlpack(tensor))",
+                    "except Exception:",
+                    "    pass",
                     "cpu_tensor = tensor.detach().to(\"cpu\")",
+                    "if cpu_tensor.dtype == torch.bfloat16:",
+                    "    cpu_tensor = cpu_tensor.to(torch.float32)",
                     "return mx.array(_np.asarray(cpu_tensor))",
                 ]
             )
@@ -182,7 +186,14 @@ class MLXGraphCodegen:
                     "try:",
                     "    tensor = _dlpack.from_dlpack(value.__dlpack__())",
                     "except Exception:",
-                    "    tensor = torch.from_numpy(_np.asarray(value))",
+                    "    fallback_value = value",
+                    "    try:",
+                    "        mlx_dtype = getattr(fallback_value, 'dtype', None)",
+                    "        if mlx_dtype == mx.bfloat16:",
+                    "            fallback_value = fallback_value.astype(mx.float32)",
+                    "    except Exception:",
+                    "        pass",
+                    "    tensor = torch.from_numpy(_np.asarray(fallback_value))",
                     "if dtype is not None:",
                     "    tensor = tensor.to(dtype=dtype)",
                     "if device is not None:",
@@ -493,6 +504,10 @@ class MLXGraphCodegen:
         target = node.target
         if target == operator.getitem:
             self._emit_getitem(node)
+        elif target == operator.add:
+            self._emit_python_add(node)
+        elif target == torch.sym_sum:
+            self._emit_sym_sum(node)
         elif target == torch.ops.aten.relu.default:
             value = self._value(node.args[0])
             self._values[node] = self._assign(node, f"mx.maximum({value}, 0)")
@@ -501,6 +516,10 @@ class MLXGraphCodegen:
             self._values[node] = self._assign(node, f"-({value})")
         elif target in _UNARY_OPS:
             self._emit_unary(node, _UNARY_OPS[target])
+        elif target in _ADD_TENSOR_TARGETS or target == _ADD_PACKET:
+            self._emit_add_tensor(node)
+        elif target in _ADD_SCALAR_TARGETS:
+            self._emit_add_scalar(node)
         elif target in _BINARY_OPS:
             self._emit_binary(node, target)
         elif target == torch.ops.aten.matmul.default:
@@ -667,7 +686,8 @@ class MLXGraphCodegen:
             )
         else:
             raise MLXCodegenError(
-                f"MLX codegen does not yet support aten op {getattr(target, '__name__', target)}"
+                "MLX codegen does not yet support aten op "
+                f"{getattr(target, '__name__', target)} (node={node.format_node()})"
             )
 
     def _emit_call_method(self, node: Node) -> None:
@@ -691,6 +711,33 @@ class MLXGraphCodegen:
         self._values[node] = self._assign(
             node, expr, meta=_extract_tensor_meta(node)
         )
+
+    def _emit_python_add(self, node: Node) -> None:
+        lhs, rhs = node.args
+        lhs_is_tensor = isinstance(lhs, Node)
+        rhs_is_tensor = isinstance(rhs, Node)
+        if lhs_is_tensor and rhs_is_tensor:
+            expr = f"{self._value(lhs)} + {self._value(rhs)}"
+        elif lhs_is_tensor and isinstance(rhs, (int, float, bool)):
+            expr = f"{self._value(lhs)} + ({self._format_scalar(rhs)})"
+        elif rhs_is_tensor and isinstance(lhs, (int, float, bool)):
+            expr = f"({self._format_scalar(lhs)}) + {self._value(rhs)}"
+        else:
+            raise MLXCodegenError(
+                "MLX python add lowering expects at least one tensor operand"
+            )
+        self._values[node] = self._assign(
+            node, expr, meta=_extract_tensor_meta(node)
+        )
+
+    def _emit_sym_sum(self, node: Node) -> None:
+        if not node.args or not isinstance(node.args[0], (tuple, list)):
+            raise MLXCodegenError("sym_sum expects a tuple/list of dimensions")
+        dims = node.args[0]
+        parts = [self._format_dim_expr(dim) for dim in dims]
+        expr = " + ".join(parts) if parts else "0"
+        result = self._assign(node, expr, meta=None)
+        self._values[node] = result
 
     def _emit_output(self, node: Node) -> None:
         output = node.args[0]
@@ -735,15 +782,36 @@ class MLXGraphCodegen:
         expr = f"{func_name}({value})"
         self._values[node] = self._assign(node, expr)
 
+    def _emit_add_tensor(self, node: Node) -> None:
+        lhs = self._value(node.args[0])
+        rhs = self._value(node.args[1])
+        alpha = self._get_alpha(node)
+        rhs_expr = rhs
+        alpha_expr = self._format_alpha(alpha)
+        if alpha_expr is not None:
+            rhs_expr = f"({rhs}) * ({alpha_expr})"
+        expr = f"{lhs} + {rhs_expr}"
+        self._values[node] = self._assign(
+            node, expr, meta=_extract_tensor_meta(node)
+        )
+
+    def _emit_add_scalar(self, node: Node) -> None:
+        lhs = self._value(node.args[0])
+        rhs = self._format_scalar(node.args[1])
+        alpha = self._get_alpha(node)
+        rhs_expr = rhs
+        alpha_expr = self._format_alpha(alpha)
+        if alpha_expr is not None:
+            rhs_expr = f"({rhs}) * ({alpha_expr})"
+        expr = f"{lhs} + ({rhs_expr})"
+        self._values[node] = self._assign(
+            node, expr, meta=_extract_tensor_meta(node)
+        )
+
     def _emit_binary(self, node: Node, target) -> None:
         lhs = self._value(node.args[0])
         rhs = self._value(node.args[1])
-        if target == torch.ops.aten.add.Tensor:
-            alpha = node.kwargs.get("alpha", 1)
-            if alpha != 1:
-                rhs = f"({rhs}) * {alpha}"
-            expr = f"{lhs} + {rhs}"
-        elif target == torch.ops.aten.mul.Tensor:
+        if target == torch.ops.aten.mul.Tensor:
             expr = f"{lhs} * {rhs}"
         elif target == torch.ops.aten.sub.Tensor:
             expr = f"{lhs} - {rhs}"
@@ -765,14 +833,33 @@ class MLXGraphCodegen:
 
     def _emit_reshape(self, node: Node) -> None:
         tensor = self._value(node.args[0])
-        meta = _extract_tensor_meta(node)
-        if meta is None or meta.shape is None:
-            raise MLXCodegenError(
-                "Missing shape metadata for reshape/view operation"
+        shape_arg = None
+        if len(node.args) > 1:
+            shape_arg = node.args[1]
+        elif "shape" in node.kwargs:
+            shape_arg = node.kwargs["shape"]
+
+        if shape_arg is None:
+            meta = _extract_tensor_meta(node)
+            if meta is None or meta.shape is None:
+                raise MLXCodegenError(
+                    "Missing shape metadata for reshape/view operation"
+                )
+            shape_literal = self._format_shape(meta.shape)
+        else:
+            if not isinstance(shape_arg, (list, tuple)):
+                raise MLXCodegenError(
+                    "MLX reshape expects explicit shape tuple/list for dynamic dimensions"
+                )
+            dims = [self._format_dim_expr(dim) for dim in shape_arg]
+            shape_literal = (
+                "(" + ", ".join(dims) + ("," if len(dims) == 1 else "") + ")"
             )
-        shape_literal = self._format_shape(meta.shape)
+
         expr = f"mx.reshape({tensor}, {shape_literal})"
-        self._values[node] = self._assign(node, expr, meta=meta)
+        self._values[node] = self._assign(
+            node, expr, meta=_extract_tensor_meta(node)
+        )
 
     def _emit_permute(self, node: Node, axes: Iterable[Any]) -> None:
         tensor = self._value(node.args[0])
@@ -795,6 +882,7 @@ class MLXGraphCodegen:
             _extract_tensor_meta(input_arg)
             if isinstance(input_arg, Node)
             else None,
+            tensor,
         )
         size_literal = self._format_shape(resolved)
         expr = f"mx.broadcast_to({tensor}, {size_literal})"
@@ -860,33 +948,112 @@ class MLXGraphCodegen:
 
     def _emit_index(self, node: Node) -> None:
         base_expr = self._value(node.args[0])
+        base_meta = self._require_tensor_meta(node.args[0], "index_input")
+        base_shape = base_meta.shape
         indices = node.args[1]
         if not isinstance(indices, (list, tuple)):
             raise MLXCodegenError("MLX index lowering expects tuple/list of indices")
-        if len(indices) != 1:
+        if len(indices) == 0:
+            self._values[node] = _MLXValue(base_expr, _extract_tensor_meta(node))
+            return
+        if base_shape is None or len(base_shape) < len(indices):
             raise MLXCodegenError(
-                "MLX index lowering currently supports a single tensor index"
+                "MLX index lowering expects as many tensor dimensions as indices"
             )
-        index_node = indices[0]
-        if not isinstance(index_node, Node):
-            raise MLXCodegenError(
-                "MLX index lowering requires tensor indices (slices/ellipsis unsupported)"
+
+        rank = len(indices)
+        dim_exprs: list[str] = []
+        for axis in range(len(base_shape)):
+            dim_var = self._new_var("index_dim")
+            self._body.writeline(f"{dim_var} = int({base_expr}.shape[{axis}])")
+            dim_exprs.append(dim_var)
+
+        index_exprs: list[str] = []
+        for idx in indices:
+            if not isinstance(idx, Node):
+                raise MLXCodegenError(
+                    "MLX index lowering requires tensor indices (slices/ellipsis unsupported)"
+                )
+            idx_meta = self._require_tensor_meta(idx, "index")
+            if idx_meta.dtype not in (
+                torch.int32,
+                torch.int64,
+                torch.int16,
+                torch.int8,
+                torch.uint8,
+            ):
+                raise MLXCodegenError(
+                    "MLX index lowering expects integer tensor indices"
+                )
+            index_exprs.append(self._value(idx))
+
+        broadcast_shape_var = self._new_var("index_broadcast_shape")
+        if len(index_exprs) == 1:
+            single_expr = index_exprs[0]
+            self._body.writeline(
+                f"{broadcast_shape_var} = tuple(int(dim) for dim in {single_expr}.shape)"
             )
-        index_meta = self._require_tensor_meta(index_node, "index")
-        if index_meta.dtype not in (
-            torch.int32,
-            torch.int64,
-            torch.int16,
-            torch.int8,
-            torch.uint8,
-        ):
-            raise MLXCodegenError(
-                "MLX index lowering expects integer tensor indices"
+        else:
+            shape_args = ", ".join(f"{expr}.shape" for expr in index_exprs)
+            self._body.writeline(
+                f"{broadcast_shape_var} = tuple(int(dim) for dim in _np.broadcast_shapes({shape_args}))"
             )
-        index_expr = self._value(index_node)
+
+        broadcasted_exprs: list[str] = []
+        for expr in index_exprs:
+            broadcast_var = self._new_var("index_broadcast")
+            self._body.writeline(
+                f"{broadcast_var} = mx.broadcast_to({expr}, {broadcast_shape_var})"
+            )
+            cast_var = self._new_var("index_cast")
+            self._body.writeline(f"{cast_var} = ({broadcast_var}).astype(mx.int64)")
+            broadcasted_exprs.append(cast_var)
+
+        flattened_dims = dim_exprs[:rank]
+        trailing_dims = dim_exprs[rank:]
+
+        stride_vars: list[str] = []
+        running = self._new_var("index_stride_run")
+        self._body.writeline(f"{running} = 1")
+        for idx in range(rank - 1, -1, -1):
+            stride_vars.insert(0, running)
+            next_running = self._new_var("index_stride_run")
+            self._body.writeline(
+                f"{next_running} = int({running}) * int({flattened_dims[idx]})"
+            )
+            running = next_running
+
+        flat_extent = running if rank else "1"
+        flatten_shape = [flat_extent] + trailing_dims
+        flatten_shape_literal = self._format_shape(flatten_shape)
+        flattened = self._new_var("index_flattened")
+        self._body.writeline(
+            f"{flattened} = mx.reshape({base_expr}, {flatten_shape_literal})"
+        )
+
+        linear_expr = None
+        for idx_expr, stride in zip(broadcasted_exprs, stride_vars):
+            term_expr = idx_expr
+            if stride != 1:
+                scaled = self._new_var("index_stride_mul")
+                self._body.writeline(f"{scaled} = ({idx_expr}) * int({stride})")
+                term_expr = scaled
+            if linear_expr is None:
+                linear_expr = term_expr
+            else:
+                accum = self._new_var("index_linear_accum")
+                self._body.writeline(f"{accum} = ({linear_expr}) + ({term_expr})")
+                linear_expr = accum
+
+        if linear_expr is None:
+            raise MLXCodegenError("MLX index lowering expected at least one tensor index")
+
+        linear_cast = self._new_var("index_linear")
+        self._body.writeline(f"{linear_cast} = ({linear_expr}).astype(mx.int64)")
+
         result = self._assign(
             node,
-            f"mx.take({base_expr}, {index_expr}, axis=0)",
+            f"mx.take({flattened}, {linear_cast}, axis=0)",
             meta=_extract_tensor_meta(node),
         )
         self._values[node] = result
@@ -895,38 +1062,92 @@ class MLXGraphCodegen:
         tensor = self._value(node.args[0])
         dim = self._to_int(node.args[1])
         start = self._to_int(node.args[2])
-        end = self._to_int(node.args[3])
+        end_arg = node.args[3] if len(node.args) > 3 else None
         step = self._to_int(node.args[4]) if len(node.args) > 4 else 1
 
         if step != 1:
             raise MLXCodegenError("MLX slice lowering does not yet support step != 1")
 
-        slice_meta = self._require_tensor_meta(node, "slice")
         input_meta = self._require_tensor_meta(node.args[0], "slice_input")
+        if input_meta.shape is None:
+            raise MLXCodegenError("MLX slice lowering requires concrete rank information")
 
-        start_indices = [0] * len(input_meta.shape)
-        start_indices[dim] = start
+        rank = len(input_meta.shape)
+        if dim < 0:
+            dim += rank
+        if dim < 0 or dim >= rank:
+            raise MLXCodegenError(f"Slice dimension {dim} out of range for rank {rank}")
+
+        axis_size_vars: list[str] = []
+        for axis in range(rank):
+            size_var = self._new_var("slice_axis_size")
+            self._body.writeline(f"{size_var} = int({tensor}.shape[{axis}])")
+            axis_size_vars.append(size_var)
+
+        dim_size_var = axis_size_vars[dim]
+
+        start_idx_var = self._new_var("slice_start_idx")
+        self._body.writeline(f"{start_idx_var} = {start}")
+        if start < 0:
+            self._body.writeline(f"{start_idx_var} = int({dim_size_var}) + ({start})")
+        self._body.writeline(
+            f"{start_idx_var} = min(max(int({start_idx_var}), 0), int({dim_size_var}))"
+        )
+
+        end_val = (
+            None
+            if end_arg is None
+            else self._to_int(end_arg)
+        )
+        end_idx_var = self._new_var("slice_end_idx")
+        if end_val is None or end_val >= _INT64_MAX:
+            self._body.writeline(f"{end_idx_var} = int({dim_size_var})")
+        else:
+            if end_val < 0:
+                base_expr = f"int({dim_size_var}) + ({end_val})"
+            else:
+                base_expr = str(end_val)
+            self._body.writeline(f"{end_idx_var} = {base_expr}")
+            self._body.writeline(
+                f"{end_idx_var} = min(max(int({end_idx_var}), 0), int({dim_size_var}))"
+            )
+
+        slice_extent_var = self._new_var("slice_extent")
+        self._body.writeline(
+            f"{slice_extent_var} = max(int({end_idx_var}) - int({start_idx_var}), 0)"
+        )
+
+        start_terms = ["0"] * rank
+        start_terms[dim] = start_idx_var
+        start_literal = "[" + ", ".join(start_terms) + "]"
         start_array = self._new_var("slice_start")
         self._body.writeline(
-            f"{start_array} = mx.array({start_indices}, dtype=mx.int32)"
+            f"{start_array} = mx.array({start_literal}, dtype=mx.int32)"
         )
 
         axes = list(range(len(input_meta.shape)))
         axes_tuple = "(" + ", ".join(str(axis) for axis in axes) + ")"
-        slice_sizes = "(" + ", ".join(str(self._to_int(s)) for s in slice_meta.shape) + ")"
+
+        slice_sizes: list[str] = []
+        for axis in range(rank):
+            if axis == dim:
+                slice_sizes.append(slice_extent_var)
+            else:
+                slice_sizes.append(axis_size_vars[axis])
+        slice_sizes_literal = "(" + ", ".join(slice_sizes) + ")"
 
         expr = (
-            f"mx.slice({tensor}, start_indices={start_array}, axes={axes_tuple}, slice_size={slice_sizes})"
+            f"mx.slice({tensor}, start_indices={start_array}, axes={axes_tuple}, slice_size={slice_sizes_literal})"
         )
-        self._values[node] = self._assign(node, expr, meta=slice_meta)
+        self._values[node] = self._assign(node, expr, meta=_extract_tensor_meta(node))
 
     def _emit_prims_iota(self, node: Node) -> None:
-        length = self._to_int(node.args[0])
-        if length < 0:
-            raise MLXCodegenError("prims.iota length must be non-negative")
-
-        start = self._to_int(node.kwargs.get("start", 0))
-        step = self._to_int(node.kwargs.get("step", 1))
+        length_arg = node.args[0]
+        length_expr = self._format_int_expr(length_arg)
+        start_arg = node.kwargs.get("start", 0)
+        step_arg = node.kwargs.get("step", 1)
+        start_expr = self._format_int_expr(start_arg)
+        step_expr = self._format_int_expr(step_arg)
         dtype_arg = node.kwargs.get("dtype")
         if not isinstance(dtype_arg, torch.dtype):
             raise MLXCodegenError("prims.iota expects a concrete torch.dtype")
@@ -938,8 +1159,11 @@ class MLXGraphCodegen:
                 f"MLX iota backend expects CPU device, got {device_arg}"
             )
 
-        end = start + length * step
-        expr = f"mx.arange({start}, {end}, {step}, dtype={mx_dtype})"
+        end_expr = self._new_var("iota_end")
+        self._body.writeline(
+            f"{end_expr} = ({start_expr}) + ({length_expr}) * ({step_expr})"
+        )
+        expr = f"mx.arange({start_expr}, {end_expr}, {step_expr}, dtype={mx_dtype})"
         self._values[node] = self._assign(
             node, expr, meta=_extract_tensor_meta(node)
         )
@@ -1194,7 +1418,8 @@ class MLXGraphCodegen:
         self,
         target_sizes: Iterable[Any],
         input_meta: Optional[_TensorMeta],
-    ) -> tuple[int, ...]:
+        tensor_expr: Optional[str] = None,
+    ) -> tuple[Any, ...]:
         sizes = list(target_sizes)
         input_shape: Optional[tuple[int, ...]] = None
         if input_meta is not None and input_meta.shape is not None:
@@ -1203,13 +1428,27 @@ class MLXGraphCodegen:
         resolved = [0] * len(sizes)
         for offset in range(1, len(sizes) + 1):
             target_dim = sizes[-offset]
+            if isinstance(target_dim, Node):
+                resolved[-offset] = target_dim
+                continue
+            input_dim = None
+            input_axis = None
             input_dim = None
             has_input_dim = False
             if input_shape is not None and offset <= input_rank:
                 input_dim = input_shape[-offset]
                 has_input_dim = True
+                input_axis = input_rank - offset
             elif input_shape is not None:
                 input_dim = 1
+            if (
+                has_input_dim
+                and tensor_expr is not None
+                and not isinstance(target_dim, (int, float, bool))
+                and target_dim != -1
+            ):
+                resolved[-offset] = f"{tensor_expr}.shape[{input_axis}]"
+                continue
             resolved[-offset] = self._resolve_expand_dim_value(
                 target_dim, input_dim, has_input_dim
             )
@@ -1217,7 +1456,9 @@ class MLXGraphCodegen:
 
     def _resolve_expand_dim_value(
         self, target_dim: Any, input_dim: Optional[int], has_input_dim: bool
-    ) -> int:
+    ) -> Any:
+        if isinstance(target_dim, Node):
+            return target_dim
         dim_value = self._to_int(target_dim)
         if dim_value == -1:
             if not has_input_dim or input_dim is None:
@@ -1265,9 +1506,7 @@ class MLXGraphCodegen:
         )
 
     def _format_shape(self, shape: Iterable[Any]) -> str:
-        formatted = []
-        for dim in shape:
-            formatted.append(str(self._to_int(dim)))
+        formatted = [self._format_dim_expr(dim) for dim in shape]
         return (
             "("
             + ", ".join(formatted)
@@ -1275,7 +1514,60 @@ class MLXGraphCodegen:
             + ")"
         )
 
+    def _format_dim_expr(self, dim: Any) -> str:
+        if isinstance(dim, Node):
+            value = self._value(dim)
+            return f"int({value})"
+        if isinstance(dim, str):
+            return dim
+        if isinstance(dim, torch.SymInt):
+            return str(self._to_int(dim))
+        if isinstance(dim, sympy.Expr):
+            return str(self._to_int(dim))
+        if isinstance(dim, bool):
+            return "1" if dim else "0"
+        if isinstance(dim, (int, float)):
+            return str(int(dim))
+        return str(self._to_int(dim))
+
+    def _format_int_expr(self, value: Any) -> str:
+        if isinstance(value, Node):
+            return f"int({self._value(value)})"
+        if isinstance(value, (int, bool)):
+            return repr(int(value))
+        if isinstance(value, float):
+            return repr(int(value))
+        if isinstance(value, torch.SymInt):
+            return str(self._to_int(value))
+        if isinstance(value, sympy.Expr):
+            return str(self._to_int(value))
+        return self._format_dim_expr(value)
+
+    def _get_alpha(self, node: Node) -> Any:
+        if len(node.args) > 2:
+            return node.args[2]
+        return node.kwargs.get("alpha", 1)
+
+    def _is_literal_one(self, value: Any) -> bool:
+        return isinstance(value, (int, float)) and value == 1
+
+    def _format_alpha(self, value: Any) -> Optional[str]:
+        if value is None or self._is_literal_one(value):
+            return None
+        return self._format_scalar(value)
+
     def _to_int(self, value: Any) -> int:
+        if isinstance(value, Node):
+            meta_val = value.meta.get("val") if hasattr(value, "meta") else None
+            if isinstance(meta_val, (int, float)):
+                return int(meta_val)
+            if isinstance(meta_val, torch.Tensor) and meta_val.numel() == 1:
+                return int(meta_val.item())
+            if meta_val is not None:
+                return self._to_int(meta_val)
+            raise MLXCodegenError(
+                f"Unable to resolve symbolic dimension from FX node {value.name}"
+            )
         if isinstance(value, int):
             return value
         if isinstance(value, torch.SymInt):
@@ -1414,8 +1706,28 @@ _UNARY_OPS = {
 # prune missing ops
 _UNARY_OPS = {k: v for k, v in _UNARY_OPS.items() if k is not None}
 
+_ADD_TENSOR_TARGETS = tuple(
+    op
+    for op in (
+        _maybe_get_aten_op("add", "Tensor"),
+    )
+    if op is not None
+)
+
+_ADD_SCALAR_TARGETS = tuple(
+    op
+    for op in (
+        _maybe_get_aten_op("add", "Scalar"),
+    )
+    if op is not None
+)
+
+try:
+    _ADD_PACKET = torch.ops.aten.add
+except AttributeError:  # pragma: no cover
+    _ADD_PACKET = None
+
 _BINARY_OPS = {
-    torch.ops.aten.add.Tensor,
     torch.ops.aten.mul.Tensor,
     torch.ops.aten.sub.Tensor,
     torch.ops.aten.div.Tensor,
