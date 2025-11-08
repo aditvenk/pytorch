@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+import operator
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 import sympy
 import torch
@@ -29,6 +30,7 @@ class _OutputSpec:
     expr: str
     meta: Optional[_TensorMeta]
     convert: bool
+    alias_input_idx: Optional[int] = None
 
 
 def _extract_tensor_meta(node: Node) -> Optional[_TensorMeta]:
@@ -56,12 +58,35 @@ def _format_dtype(dtype: Optional[torch.dtype]) -> str:
 
 def _format_device(device: Optional[torch.device]) -> str:
     if device is None:
-        return "torch.device('cpu')"
+        return "None"
     return f"torch.device({str(device)!r})"
 
 
 class MLXCodegenError(Exception):
     pass
+
+
+_TORCH_DTYPE_TO_MX = {
+    torch.bool: "mx.bool_",
+    torch.uint8: "mx.uint8",
+    torch.int8: "mx.int8",
+    torch.int16: "mx.int16",
+    torch.int32: "mx.int32",
+    torch.int64: "mx.int64",
+    torch.float16: "mx.float16",
+    torch.bfloat16: "mx.bfloat16",
+    torch.float32: "mx.float32",
+    torch.float64: "mx.float64",
+}
+
+
+def _torch_dtype_to_mx(dtype: torch.dtype) -> str:
+    mx_dtype = _TORCH_DTYPE_TO_MX.get(dtype)
+    if mx_dtype is None:
+        raise MLXCodegenError(
+            f"MLX codegen does not yet support dtype {dtype!r}"
+        )
+    return mx_dtype
 
 
 class MLXGraphCodegen:
@@ -72,7 +97,11 @@ class MLXGraphCodegen:
     positional arguments tuple.
     """
 
-    def __init__(self, graph_lowering):
+    def __init__(
+        self,
+        graph_lowering,
+        mutated_input_idxs: Optional[Sequence[int]] = None,
+    ):
         self._graph = graph_lowering
         self._gm: GraphModule = graph_lowering.orig_gm
         self._values: Dict[Node, _MLXValue] = {}
@@ -81,6 +110,15 @@ class MLXGraphCodegen:
         self._converted_constants: Dict[str, str] = {}
         self._output_specs: list[_OutputSpec] = []
         self._input_metas: list[Optional[_TensorMeta]] = []
+        self._placeholder_indices: dict[Node, int] = {}
+        self._output_aliases: list[Optional[int]] = []
+        self._mutated_input_idxs = (
+            set(mutated_input_idxs) if mutated_input_idxs is not None else set()
+        )
+        self._mutated_input_specs: list[tuple[int, Optional[_TensorMeta]]] = []
+        self._additional_mutated_idxs: set[int] = set()
+        self._placeholder_nodes: list[Node] = []
+        self._mutated_exprs: list[str] = []
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -101,6 +139,7 @@ class MLXGraphCodegen:
                 "",
                 "try:",
                 "    import mlx.core as mx",
+                "    from mlx.core import fast as _mx_fast",
                 "except ImportError as exc:",
                 "    raise RuntimeError(",
                 "        \"TORCH_INDUCTOR_MLX requires the 'mlx' package to be installed.\"",
@@ -172,6 +211,15 @@ class MLXGraphCodegen:
                     module.writeline("None,")
         module.writelines(["]"])
 
+        module.writelines(["", "_OUTPUT_ALIASES = ["])
+        with module.indent():
+            for alias in self._output_aliases:
+                if alias is None:
+                    module.writeline("None,")
+                else:
+                    module.writeline(f"{alias},")
+        module.writelines(["]"])
+
         module.writelines(["", "_INPUT_METAS = ["])
         with module.indent():
             for meta in self._input_metas:
@@ -190,46 +238,94 @@ class MLXGraphCodegen:
                 module.writeline(
                     f"({dtype_expr}, {device_expr}, {shape_literal}),"
                 )
+        module.writelines(["]"])
+
+        module.writelines(["", "_MUTATED_INPUT_SPECS = ["])
+        with module.indent():
+            for index, meta in self._mutated_input_specs:
+                if meta is None:
+                    module.writeline(f"({index}, None, None),")
+                    continue
+                dtype_expr = _format_dtype(meta.dtype)
+                device_expr = _format_device(meta.device)
+                module.writeline(f"({index}, {dtype_expr}, {device_expr}),")
         module.writelines(["]", "", "def call(args):"])
         with module.indent():
-            module.writelines(
-                [
-                    "mx_args = [_to_mx(value) for value in args]",
-                    "mx_results = _MLX_COMPILED(*mx_args)",
-                    "if not _OUTPUT_SPECS:",
-                ]
-            )
+            module.writeline("mx_args = []")
+            module.writeline("for _value in args:")
             with module.indent():
-                module.writeline("return tuple()")
-            module.writelines(
-                [
-                    "if not isinstance(mx_results, (tuple, list)):",
-                ]
-            )
+                module.writeline("mx_args.append(_to_mx(_value))")
+            module.writeline("mx_results = _MLX_COMPILED(*mx_args)")
+            module.writeline("if not isinstance(mx_results, (tuple, list)):")
             with module.indent():
                 module.writeline("mx_results = (mx_results,)")
-            module.writelines(["else:"])
+            module.writeline("else:")
             with module.indent():
                 module.writeline("mx_results = tuple(mx_results)")
-            module.writelines(["assert len(mx_results) == len(_OUTPUT_SPECS)"])
-            module.writelines(
-                [
-                    "results = []",
-                    "for _value, _spec in zip(mx_results, _OUTPUT_SPECS):",
-                ]
-            )
+            module.writeline("mutated_count = len(_MUTATED_INPUT_SPECS)")
+            module.writeline("if mutated_count:")
             with module.indent():
-                module.writelines(["if _spec is None:"])
+                module.writeline("if mutated_count > len(mx_results):")
                 with module.indent():
-                    module.writeline("results.append(_value)")
-                module.writelines(["else:"])
-                with module.indent():
-                    module.writelines(
-                        [
-                            "dtype, device = _spec",
-                            "results.append(_from_mx(_value, dtype=dtype, device=device))",
-                        ]
+                    module.writeline(
+                        "raise RuntimeError('MLX kernel did not return enough mutated values')"
                     )
+                module.writeline("mutated_values = mx_results[-mutated_count:]")
+                module.writeline("mx_outputs = mx_results[:-mutated_count]")
+            module.writeline("else:")
+            with module.indent():
+                module.writeline("mutated_values = tuple()")
+                module.writeline("mx_outputs = mx_results")
+            module.writeline("if mutated_count:")
+            with module.indent():
+                module.writeline("if len(mutated_values) != mutated_count:")
+                with module.indent():
+                    module.writeline(
+                        "raise RuntimeError('Unexpected number of mutated values returned by MLX kernel')"
+                    )
+                module.writeline(
+                    "for (_idx, _dtype, _device), _value in zip(_MUTATED_INPUT_SPECS, mutated_values):"
+                )
+                with module.indent():
+                    module.writeline(
+                        "if _idx < len(args) and isinstance(args[_idx], torch.Tensor):"
+                    )
+                    with module.indent():
+                        module.writelines(
+                            [
+                                "_tensor = args[_idx]",
+                                "_updated = _from_mx(_value, dtype=_dtype, device=_device)",
+                                "_tensor.copy_(",
+                                "    _updated.to(device=_tensor.device, dtype=_tensor.dtype)",
+                                ")",
+                            ]
+                        )
+            module.writeline("results = []")
+            module.writeline("if _OUTPUT_SPECS:")
+            with module.indent():
+                module.writeline("if len(mx_outputs) != len(_OUTPUT_SPECS):")
+                with module.indent():
+                    module.writeline(
+                        "raise RuntimeError('Unexpected number of MLX outputs')"
+                    )
+                module.writeline("for _value, _spec in zip(mx_outputs, _OUTPUT_SPECS):")
+                with module.indent():
+                    module.writeline("if _spec is None:")
+                    with module.indent():
+                        module.writeline("results.append(_value)")
+                    module.writeline("else:")
+                    with module.indent():
+                        module.writelines(
+                            [
+                                "dtype, device = _spec",
+                                "results.append(_from_mx(_value, dtype=dtype, device=device))",
+                            ]
+                        )
+            module.writeline("for _idx, _alias in enumerate(_OUTPUT_ALIASES):")
+            with module.indent():
+                module.writeline("if _alias is not None:")
+                with module.indent():
+                    module.writeline("results[_idx] = args[_alias]")
             module.writeline("return tuple(results)")
 
         module.writelines(
@@ -319,12 +415,17 @@ class MLXGraphCodegen:
     def _emit_function_body(self) -> None:
         self._output_specs = []
         self._input_metas = []
+        self._output_aliases = []
+        self._placeholder_indices = {}
+        self._mutated_input_specs = []
         placeholder_nodes = [
             node for node in self._gm.graph.nodes if node.op == "placeholder"
         ]
         if placeholder_nodes:
             self._body.writeline("_args = tuple(args)")
         for index, node in enumerate(placeholder_nodes):
+            self._placeholder_nodes.append(node)
+            self._placeholder_indices[node] = index
             mlx_name = self._new_var(
                 normalize_name(node.name or f"arg{index}")
             )
@@ -358,6 +459,24 @@ class MLXGraphCodegen:
 
         if output_node is None:
             raise MLXCodegenError("FX graph lacks an output node")
+
+        mutated_indices = self._mutated_input_idxs | self._additional_mutated_idxs
+        self._mutated_input_specs = []
+        self._mutated_exprs = []
+        for index in sorted(mutated_indices):
+            meta = self._input_metas[index] if index < len(self._input_metas) else None
+            self._mutated_input_specs.append((index, meta))
+            placeholder_node = (
+                self._placeholder_nodes[index]
+                if index < len(self._placeholder_nodes)
+                else None
+            )
+            if placeholder_node is None or placeholder_node not in self._values:
+                raise MLXCodegenError(
+                    f"Missing MLX value for mutated input at index {index}"
+                )
+            self._mutated_exprs.append(self._values[placeholder_node].name)
+
         self._emit_output(output_node)
 
     def _emit_get_attr(self, node: Node) -> None:
@@ -372,7 +491,9 @@ class MLXGraphCodegen:
 
     def _emit_call_function(self, node: Node) -> None:
         target = node.target
-        if target == torch.ops.aten.relu.default:
+        if target == operator.getitem:
+            self._emit_getitem(node)
+        elif target == torch.ops.aten.relu.default:
             value = self._value(node.args[0])
             self._values[node] = self._assign(node, f"mx.maximum({value}, 0)")
         elif target == torch.ops.aten.neg.default:
@@ -440,7 +561,9 @@ class MLXGraphCodegen:
             self._emit_squeeze(node)
         elif target == torch.ops.aten.clone.default:
             val = self._value(node.args[0])
-            self._values[node] = self._assign(node, val)
+            self._values[node] = self._assign(
+                node, f"mx.array({val})", meta=_extract_tensor_meta(node)
+            )
         elif target in _EXPAND_TARGETS:
             self._emit_expand(node)
         elif target in _AMAX_TARGETS:
@@ -451,6 +574,23 @@ class MLXGraphCodegen:
             self._emit_comparison_scalar(node, "mx.less_equal")
         elif target == torch.ops.aten.full.default:
             self._emit_full(node)
+        elif target == torch.ops.aten.copy_.default:
+            dest = node.args[0]
+            src = self._value(node.args[1])
+            result = self._assign(
+                node, f"mx.array({src})", meta=_extract_tensor_meta(node)
+            )
+            self._values[node] = result
+            if isinstance(dest, Node):
+                idx = self._placeholder_indices.get(dest)
+                if idx is not None:
+                    self._additional_mutated_idxs.add(idx)
+                    self._values[dest] = result
+        elif (
+            target
+            == torch.ops.aten._scaled_dot_product_attention_math_for_mps.default
+        ):
+            self._emit_sdpa_mps(node)
         elif target == torch.ops.aten.where.self:
             cond = self._value(node.args[0])
             a = self._value(node.args[1])
@@ -460,9 +600,15 @@ class MLXGraphCodegen:
             )
         elif target == torch.ops.aten.to.dtype:
             tensor = self._value(node.args[0])
-            dtype = _format_dtype(node.args[1])
+            desired_dtype = node.args[1]
+            if not isinstance(desired_dtype, torch.dtype):
+                raise MLXCodegenError(
+                    "MLX codegen expects dtype arguments to be concrete values"
+                )
+            mx_dtype = _torch_dtype_to_mx(desired_dtype)
+            expr = f"({tensor}).astype({mx_dtype})"
             self._values[node] = self._assign(
-                node, f"mx.astype({tensor}, {dtype})"
+                node, expr, meta=_extract_tensor_meta(node)
             )
         else:
             raise MLXCodegenError(
@@ -480,24 +626,48 @@ class MLXGraphCodegen:
                 f"Unsupported Tensor method for MLX codegen: {method}"
             )
 
+    def _emit_getitem(self, node: Node) -> None:
+        base = node.args[0]
+        if not isinstance(node.args[1], int):
+            index = self._to_int(node.args[1])
+        else:
+            index = node.args[1]
+        expr = f"{self._value(base)}[{index}]"
+        self._values[node] = self._assign(
+            node, expr, meta=_extract_tensor_meta(node)
+        )
+
     def _emit_output(self, node: Node) -> None:
         output = node.args[0]
         outputs = output if isinstance(output, (tuple, list)) else (output,)
         self._output_specs = []
         for out in outputs:
+            alias_idx: Optional[int] = None
             if isinstance(out, Node):
                 mlx_value = self._values[out]
                 meta = mlx_value.meta or _extract_tensor_meta(out)
+                alias_idx = self._placeholder_indices.get(out)
+                convert = alias_idx is None
                 self._output_specs.append(
-                    _OutputSpec(expr=mlx_value.name, meta=meta, convert=True)
+                    _OutputSpec(
+                        expr=mlx_value.name,
+                        meta=meta,
+                        convert=convert,
+                        alias_input_idx=alias_idx,
+                    )
                 )
             else:
                 self._output_specs.append(
                     _OutputSpec(expr=repr(out), meta=None, convert=False)
                 )
+            self._output_aliases.append(alias_idx)
         exprs = [spec.expr for spec in self._output_specs]
-        tuple_expr = ", ".join(exprs)
-        if len(exprs) == 1:
+        all_exprs = exprs + self._mutated_exprs
+        if not all_exprs:
+            self._body.writeline("return tuple()")
+            return
+        tuple_expr = ", ".join(all_exprs)
+        if len(all_exprs) == 1:
             tuple_expr = f"{tuple_expr},"
         self._body.writeline(f"return ({tuple_expr})")
 
@@ -558,13 +728,20 @@ class MLXGraphCodegen:
         )
 
     def _emit_expand(self, node: Node) -> None:
-        tensor = self._value(node.args[0])
+        input_arg = node.args[0]
+        tensor = self._value(input_arg)
         size = node.args[1]
         if not isinstance(size, (tuple, list)):
             raise MLXCodegenError(
                 "Expected expand sizes to be a tuple or list"
             )
-        size_literal = self._format_shape(size)
+        resolved = self._normalize_expand_sizes(
+            tuple(size),
+            _extract_tensor_meta(input_arg)
+            if isinstance(input_arg, Node)
+            else None,
+        )
+        size_literal = self._format_shape(resolved)
         expr = f"mx.broadcast_to({tensor}, {size_literal})"
         self._values[node] = self._assign(
             node, expr, meta=_extract_tensor_meta(node)
@@ -611,11 +788,30 @@ class MLXGraphCodegen:
     def _emit_full(self, node: Node) -> None:
         shape = node.args[0]
         value_expr = self._format_scalar(node.args[1])
+        dtype_arg = self._get_kwarg_or_pos(node, 2, "dtype")
+        mx_dtype_expr = None
+        if dtype_arg is not None:
+            if not isinstance(dtype_arg, torch.dtype):
+                raise MLXCodegenError(
+                    "MLX codegen expects dtype arguments to be concrete torch.dtype values"
+                )
+            mx_dtype_expr = _torch_dtype_to_mx(dtype_arg)
+        device_arg = self._get_kwarg_or_pos(node, 4, "device")
+        normalized_device = self._normalize_device_arg(device_arg)
+        if normalized_device is not None and normalized_device.type != "cpu":
+            raise MLXCodegenError(
+                f"MLX codegen only supports CPU tensors, requested device {normalized_device}"
+            )
         if isinstance(shape, (list, tuple)) and len(shape) == 0:
             expr = f"mx.array({value_expr})"
+            if mx_dtype_expr is not None:
+                expr = f"({expr}).astype({mx_dtype_expr})"
         else:
             shape_literal = self._format_shape(shape)
-            expr = f"mx.full({shape_literal}, {value_expr})"
+            expr = f"mx.full({shape_literal}, {value_expr}"
+            if mx_dtype_expr is not None:
+                expr = f"{expr}, dtype={mx_dtype_expr}"
+            expr = f"{expr})"
         self._values[node] = self._assign(
             node, expr, meta=_extract_tensor_meta(node)
         )
@@ -681,6 +877,162 @@ class MLXGraphCodegen:
             node, expr, meta=_extract_tensor_meta(node)
         )
 
+    def _emit_sdpa_mps(self, node: Node) -> None:
+        query_node = node.args[0]
+        key_node = node.args[1]
+        value_node = node.args[2]
+
+        query_expr = self._value(query_node)
+        key_expr = self._value(key_node)
+        value_expr = self._value(value_node)
+
+        query_meta = self._require_tensor_meta(query_node, "query")
+        key_meta = self._require_tensor_meta(key_node, "key")
+
+        if len(query_meta.shape) < 2 or len(key_meta.shape) < 2:
+            raise MLXCodegenError(
+                "Scaled dot-product attention requires rank >= 2 for query/key tensors"
+            )
+
+        q_len = self._to_int(query_meta.shape[-2])
+        head_dim = self._to_int(query_meta.shape[-1])
+        k_len = self._to_int(key_meta.shape[-2])
+
+        scale_arg = node.kwargs.get("scale", None)
+        if scale_arg is None:
+            scale_expr = f"(1.0 / ({head_dim} ** 0.5))"
+        else:
+            scale_expr = self._format_scalar(scale_arg)
+
+        scores_dtype = (
+            _torch_dtype_to_mx(query_meta.dtype)
+            if query_meta.dtype is not None
+            else "mx.float32"
+        )
+
+        attn_mask_arg = self._get_kwarg_or_pos(node, 3, "attn_mask")
+        mask_add_expr: Optional[str] = None
+        if attn_mask_arg is not None:
+            if not isinstance(attn_mask_arg, Node):
+                raise MLXCodegenError(
+                    "MLX codegen expects attention masks to be tensor inputs"
+                )
+            mask_add_expr = self._maybe_cast_mask(
+                self._value(attn_mask_arg), scores_dtype
+            )
+
+        dropout_p_arg = self._get_kwarg_or_pos(node, 4, "dropout_p")
+        if dropout_p_arg is None:
+            dropout_p = 0.0
+        elif isinstance(dropout_p_arg, (int, float)):
+            dropout_p = float(dropout_p_arg)
+        else:
+            raise MLXCodegenError(
+                "MLX codegen requires dropout probability to be a numeric literal"
+            )
+
+        is_causal_arg = self._get_kwarg_or_pos(node, 5, "is_causal")
+        if is_causal_arg is None:
+            is_causal = False
+        elif isinstance(is_causal_arg, bool):
+            is_causal = is_causal_arg
+        else:
+            raise MLXCodegenError(
+                "MLX codegen requires is_causal to be a boolean literal"
+            )
+
+        dropout_mask_arg = self._get_kwarg_or_pos(node, 6, "dropout_mask")
+        if dropout_mask_arg is not None:
+            raise MLXCodegenError(
+                "MLX codegen does not yet support custom dropout masks in SDPA"
+            )
+
+        fast_mask_arg = "None"
+        if mask_add_expr is not None:
+            fast_mask_arg = mask_add_expr
+
+        if is_causal:
+            causal_mask = self._build_causal_additive_mask(
+                q_len, k_len, scores_dtype
+            )
+            if mask_add_expr is None:
+                fast_mask_arg = "'causal'"
+                mask_add_expr = causal_mask
+            else:
+                mask_add_expr = self._combine_masks(mask_add_expr, causal_mask)
+                fast_mask_arg = mask_add_expr
+
+        output_var = self._new_var("sdpa_output")
+        self._body.writeline(
+            f"{output_var} = _mx_fast.scaled_dot_product_attention({query_expr}, {key_expr}, {value_expr}, scale={scale_expr}, mask={fast_mask_arg})"
+        )
+
+        probs_var = self._emit_sdpa_probs(
+            query_expr,
+            key_expr,
+            scale_expr,
+            mask_add_expr,
+        )
+
+        tuple_var = self._new_var("sdpa_result")
+        self._body.writeline(f"{tuple_var} = ({output_var}, {probs_var})")
+        self._values[node] = _MLXValue(tuple_var, None)
+
+    def _emit_sdpa_probs(
+        self,
+        query_expr: str,
+        key_expr: str,
+        scale_expr: str,
+        mask_expr: Optional[str],
+    ) -> str:
+        scores_var = self._new_var("sdpa_scores")
+        self._body.writeline(
+            f"{scores_var} = mx.matmul({query_expr}, mx.swapaxes({key_expr}, -2, -1))"
+        )
+        self._body.writeline(f"{scores_var} = ({scores_var}) * ({scale_expr})")
+        if mask_expr is not None:
+            self._body.writeline(f"{scores_var} = ({scores_var}) + ({mask_expr})")
+        probs_var = self._new_var("sdpa_probs")
+        self._body.writeline(f"{probs_var} = mx.softmax({scores_var}, axis=-1)")
+        return probs_var
+
+    def _normalize_expand_sizes(
+        self,
+        target_sizes: Iterable[Any],
+        input_meta: Optional[_TensorMeta],
+    ) -> tuple[int, ...]:
+        sizes = list(target_sizes)
+        input_shape: Optional[tuple[int, ...]] = None
+        if input_meta is not None and input_meta.shape is not None:
+            input_shape = tuple(self._to_int(dim) for dim in input_meta.shape)
+        input_rank = len(input_shape) if input_shape is not None else 0
+        resolved = [0] * len(sizes)
+        for offset in range(1, len(sizes) + 1):
+            target_dim = sizes[-offset]
+            input_dim = None
+            has_input_dim = False
+            if input_shape is not None and offset <= input_rank:
+                input_dim = input_shape[-offset]
+                has_input_dim = True
+            elif input_shape is not None:
+                input_dim = 1
+            resolved[-offset] = self._resolve_expand_dim_value(
+                target_dim, input_dim, has_input_dim
+            )
+        return tuple(resolved)
+
+    def _resolve_expand_dim_value(
+        self, target_dim: Any, input_dim: Optional[int], has_input_dim: bool
+    ) -> int:
+        dim_value = self._to_int(target_dim)
+        if dim_value == -1:
+            if not has_input_dim or input_dim is None:
+                raise MLXCodegenError(
+                    "expand(-1, ...) requires shape metadata for the corresponding dimension"
+                )
+            return input_dim
+        return dim_value
+
     # ------------------------------------------------------------------ #
     # Utility helpers
     # ------------------------------------------------------------------ #
@@ -712,6 +1064,8 @@ class MLXGraphCodegen:
             return self._value(value)
         if isinstance(value, (int, float)):
             return repr(value)
+        if isinstance(value, bool):
+            return "True" if value else "False"
         raise MLXCodegenError(
             f"Unsupported scalar value for MLX expression: {type(value)}"
         )
@@ -750,11 +1104,78 @@ class MLXGraphCodegen:
         value = getattr(self._gm, target)
         if not isinstance(value, torch.Tensor):
             raise MLXCodegenError(
-                f"Expected tensor constant for attribute {target!r}, found {type(value)}"
-            )
+            f"Expected tensor constant for attribute {target!r}, found {type(value)}"
+        )
         name = self._graph.add_tensor_constant(value, name=target)
         self._converted_constants[target] = name
         return name
+
+    def _require_tensor_meta(self, node: Node, context: str) -> _TensorMeta:
+        meta = _extract_tensor_meta(node)
+        if meta is None or meta.shape is None:
+            raise MLXCodegenError(
+                f"Missing tensor metadata for {context} in MLX codegen"
+            )
+        return meta
+
+    def _expand_mask_for_attention(self, mask_var: str) -> str:
+        expanded = self._new_var("sdpa_mask")
+        self._body.writeline(
+            f"{expanded} = mx.expand_dims(mx.expand_dims({mask_var}, 0), 0)"
+        )
+        return expanded
+
+    def _maybe_cast_mask(self, mask_expr: str, dtype_expr: str) -> str:
+        casted = self._new_var("sdpa_mask_cast")
+        self._body.writeline(f"{casted} = ({mask_expr}).astype({dtype_expr})")
+        return casted
+
+    def _combine_masks(self, a_expr: str, b_expr: str) -> str:
+        combined = self._new_var("sdpa_mask_combined")
+        self._body.writeline(f"{combined} = ({a_expr}) + ({b_expr})")
+        return combined
+
+    def _build_causal_additive_mask(
+        self, q_len: int, k_len: int, dtype_expr: str
+    ) -> str:
+        mask_bool = self._new_var("sdpa_causal_mask_bool")
+        base_mask_shape = self._format_shape((q_len, k_len))
+        self._body.writeline(
+            f"{mask_bool} = mx.triu(mx.ones({base_mask_shape}, dtype=mx.bool_), 1)"
+        )
+        expanded_bool = self._expand_mask_for_attention(mask_bool)
+        mask_shape = self._format_shape((1, 1, q_len, k_len))
+        neg_inf = self._new_var("sdpa_neg_inf")
+        self._body.writeline(
+            f"{neg_inf} = mx.full({mask_shape}, float('-inf'), dtype={dtype_expr})"
+        )
+        zeros = self._new_var("sdpa_zero_mask")
+        self._body.writeline(f"{zeros} = mx.zeros({mask_shape}, dtype={dtype_expr})")
+        mask_add = self._new_var("sdpa_causal_mask_add")
+        self._body.writeline(
+            f"{mask_add} = mx.where({expanded_bool}, {neg_inf}, {zeros})"
+        )
+        return mask_add
+
+    def _get_kwarg_or_pos(
+        self, node: Node, position: int, name: str
+    ) -> Any:
+        if len(node.args) > position:
+            return node.args[position]
+        return node.kwargs.get(name)
+
+    def _normalize_device_arg(
+        self, value: Any
+    ) -> Optional[torch.device]:
+        if value is None:
+            return None
+        if isinstance(value, torch.device):
+            return value
+        if isinstance(value, str):
+            return torch.device(value)
+        raise MLXCodegenError(
+            f"Unsupported device specification for MLX codegen: {value!r}"
+        )
 
 
 # ---------------------------------------------------------------------- #

@@ -3,7 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch._inductor import config
 
+import pytest
 
+MLX_IMPORT_ERROR = None
+try:
+    import mlx.core as _mx  # noqa: F401
+except Exception as exc:  # pragma: no cover - import-time failure
+    MLX_IMPORT_ERROR = exc
+
+pytestmark = pytest.mark.skipif(
+    MLX_IMPORT_ERROR is not None,
+    reason=f"mlx.core unavailable: {MLX_IMPORT_ERROR}",
+)
 def test_mlx_backend_torch_compile_matches_eager():
     x = torch.randn(16, 16)
     y = torch.randn(16, 16)
@@ -196,3 +207,110 @@ def test_mlx_backend_torch_compile_attention_training_loop():
         compiled_losses = run_training(compiled_model, lambda: compiled(inputs))
 
     torch.testing.assert_close(compiled_losses, eager_losses)
+
+
+def test_mlx_backend_inplace_mutation_propagates():
+    torch.manual_seed(5)
+
+    def fn(t):
+        t.add_(2.0)
+        return t
+
+    eager_input = torch.randn(6)
+    eager_expected = fn(eager_input.clone())
+
+    compiled_input = eager_input.clone()
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_output = compiled(compiled_input)
+
+    torch.testing.assert_close(compiled_input, eager_expected)
+    torch.testing.assert_close(compiled_output, eager_expected)
+    assert compiled_output.data_ptr() == compiled_input.data_ptr()
+
+
+def test_mlx_backend_clone_creates_copy():
+    torch.manual_seed(6)
+
+    def fn(t):
+        cloned = t.clone()
+        cloned.add_(3.0)
+        return cloned
+
+    x = torch.randn(4, 4)
+    eager = fn(x.clone())
+
+    compiled_input = x.clone()
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_output = compiled(compiled_input)
+
+    torch.testing.assert_close(compiled_output, eager)
+    assert compiled_output.data_ptr() != compiled_input.data_ptr()
+    torch.testing.assert_close(compiled_input, x)
+
+
+def test_mlx_backend_expand_with_negative_one():
+    torch.manual_seed(7)
+    base = torch.randn(3, 2)
+
+    def fn(t):
+        expanded = t.expand(-1, t.shape[1])
+        return expanded * 2.0
+
+    eager = fn(base)
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_result = compiled(base)
+
+    torch.testing.assert_close(compiled_result, eager)
+
+
+def test_mlx_backend_full_respects_dtype():
+    def fn():
+        return torch.full((2, 2), 7, dtype=torch.int64)
+
+    eager = fn()
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_result = compiled()
+
+    torch.testing.assert_close(compiled_result, eager)
+    assert compiled_result.dtype == torch.int64
+
+
+def test_mlx_backend_sdpa_mps_op():
+    if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
+        pytest.skip("MPS backend required for SDPA reference")
+    torch.manual_seed(8)
+    batch, heads, seq_len, head_dim = 2, 2, 4, 8
+    device = torch.device("mps")
+    q = torch.randn(batch, heads, seq_len, head_dim, device=device)
+    k = torch.randn(batch, heads, seq_len, head_dim, device=device)
+    v = torch.randn(batch, heads, seq_len, head_dim, device=device)
+    mask = torch.zeros(batch, 1, seq_len, seq_len, device=device)
+    scale = head_dim ** -0.5
+
+    def fn(query, key, value, attn_mask):
+        return torch.ops.aten._scaled_dot_product_attention_math_for_mps.default(
+            query,
+            key,
+            value,
+            attn_mask,
+            0.0,
+            False,
+            None,
+            scale=scale,
+        )
+
+    eager_out, eager_attn = fn(q, k, v, mask)
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out, compiled_attn = compiled(q, k, v, mask)
+
+    torch.testing.assert_close(compiled_out, eager_out)
+    torch.testing.assert_close(compiled_attn, eager_attn)

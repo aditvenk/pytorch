@@ -2340,7 +2340,18 @@ class GraphLowering(torch.fx.Interpreter):
     def _codegen_mlx(self) -> tuple[ValueWithLineMap, ValueWithLineMap]:
         from .codegen.mlx import MLXGraphCodegen
 
-        builder = MLXGraphCodegen(self)
+        if not self.mutated_input_idxs and self.mutated_inputs:
+            graph_input_names = list(self.graph_inputs.keys())
+            self.mutated_input_idxs = [
+                idx
+                for idx, name in enumerate(graph_input_names)
+                if name in self.mutated_inputs
+            ]
+
+        builder = MLXGraphCodegen(
+            self,
+            mutated_input_idxs=self.mutated_input_idxs,
+        )
         wrapper_code = builder.generate()
         empty = ValueWithLineMap("", [])
         return wrapper_code, empty
@@ -2368,6 +2379,8 @@ class GraphLowering(torch.fx.Interpreter):
     ) -> tuple[
         int, list[tuple[BaseSchedulerNode, int]], list[tuple[BaseSchedulerNode, float]]
     ]:
+        if self.scheduler is None:
+            return 0, [], []
         total_bytes = 0
         node_counts = []
         node_runtimes = []
