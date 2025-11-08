@@ -314,3 +314,192 @@ def test_mlx_backend_sdpa_mps_op():
 
     torch.testing.assert_close(compiled_out, eager_out)
     torch.testing.assert_close(compiled_attn, eager_attn)
+
+
+def test_mlx_backend_add_tensor():
+    torch.manual_seed(9)
+    a = torch.randn(5, 3)
+    b = torch.randn(5, 3)
+
+    def fn(x, y):
+        return torch.add(x, y, alpha=2.0)
+
+    eager = fn(a, b)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(a, b)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_bitwise_and_tensor():
+    x = torch.randint(0, 8, (4, 4), dtype=torch.int32)
+    y = torch.randint(0, 8, (4, 4), dtype=torch.int32)
+
+    def fn(a, b):
+        return torch.bitwise_and(a, b)
+
+    eager = fn(x, y)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x, y)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_cat_default():
+    torch.manual_seed(10)
+    tensors = [torch.randn(2, 3) for _ in range(3)]
+
+    def fn(a, b, c):
+        return torch.cat([a, b, c], dim=0)
+
+    eager = fn(*tensors)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(*tensors)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_cos_default():
+    torch.manual_seed(11)
+    x = torch.randn(6, 6)
+
+    def fn(t):
+        return torch.cos(t)
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_embedding_default():
+    torch.manual_seed(12)
+    weight = torch.randn(6, 4)
+    indices = torch.tensor([[0, 2, 4], [3, 5, 0]], dtype=torch.long)
+
+    def fn(w, idx):
+        return torch.embedding(w, idx)
+
+    eager = fn(weight, indices)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(weight, indices)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_index_tensor():
+    torch.manual_seed(13)
+    data = torch.randn(5, 3)
+    idx = torch.tensor([4, 1, 3], dtype=torch.long)
+
+    def fn(x, index):
+        return x[index]
+
+    eager = fn(data, idx)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(data, idx)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_pow_tensor_scalar():
+    torch.manual_seed(16)
+    x = torch.rand(4, 4).clamp_min(1e-3)
+
+    def fn(t):
+        return torch.pow(t, 1.5)
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_slice_tensor():
+    torch.manual_seed(17)
+    x = torch.randn(5, 6, 7)
+
+    def fn(t):
+        return t[:, 1:4, :]
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_prims_convert_element_type():
+    torch.manual_seed(18)
+    x = torch.randn(4, 4, dtype=torch.float64)
+
+    def fn(t):
+        return torch.ops.prims.convert_element_type.default(t, torch.float32)
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_prims_iota():
+    def fn():
+        return torch.ops.prims.iota.default(
+            6,
+            start=2,
+            step=3,
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+            requires_grad=False,
+        )
+
+    eager = fn()
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled()
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_le_tensor():
+    torch.manual_seed(14)
+    a = torch.randn(3, 3)
+    b = torch.randn(3, 3)
+
+    def fn(x, y):
+        return torch.le(x, y)
+
+    eager = fn(a, b)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(a, b)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_mean_dim():
+    torch.manual_seed(15)
+    x = torch.randn(2, 4, 6)
+
+    def fn(t):
+        return torch.mean(t, dim=1, keepdim=True)
+
+    eager = fn(x)
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x)
+
+    torch.testing.assert_close(compiled_out, eager)
