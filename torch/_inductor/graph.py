@@ -2348,6 +2348,25 @@ class GraphLowering(torch.fx.Interpreter):
                 if name in self.mutated_inputs
             ]
 
+        # Run FX-level graph passes for MLX codegen.
+        from .fx_passes.mlx_rms_norm import fuse_mlx_rms_norm
+        fuse_mlx_rms_norm(self.orig_gm)
+        if self.orig_gm.graph.eliminate_dead_code():
+            self.orig_gm.recompile()
+
+        # Emit optimized FX graph to trace logs.
+        trace_structured(
+            "artifact",
+            metadata_fn=lambda: {
+                "name": "mlx_post_fx_graph",
+                "encoding": "string",
+            },
+            payload_fn=lambda: self.orig_gm.print_readable(
+                print_output=False,
+                include_stride=True,
+                include_device=True,
+            ),
+        )
         builder = MLXGraphCodegen(
             self,
             mutated_input_idxs=self.mutated_input_idxs,

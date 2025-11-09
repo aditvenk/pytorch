@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from torch._inductor import codecache, config, exc as inductor_exc
 import torch._dynamo.config as dynamo_config
 from torch._inductor.compile_fx import compile_fx
+from torch.fx import symbolic_trace
+from torch.fx.passes.shape_prop import ShapeProp
 from unittest import mock
 
 import pytest
@@ -296,8 +298,6 @@ def test_mlx_backend_full_respects_dtype():
 
 
 def test_mlx_backend_sdpa_mps_op():
-    if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
-        pytest.skip("MPS backend required for SDPA reference")
     torch.manual_seed(8)
     batch, heads, seq_len, head_dim = 2, 2, 4, 8
     device = torch.device("mps")
@@ -324,6 +324,39 @@ def test_mlx_backend_sdpa_mps_op():
     with config.patch({"mlx_codegen": True}):
         compiled = torch.compile(fn, backend="inductor", fullgraph=True)
         compiled_out, compiled_attn = compiled(q, k, v, mask)
+
+    torch.testing.assert_close(compiled_out, eager_out)
+    torch.testing.assert_close(compiled_attn, eager_attn)
+
+
+def test_mlx_backend_sdpa_mps_causal_no_mask():
+    torch.manual_seed(8001)
+    batch, heads, seq_len, head_dim = 1, 2, 4, 8
+    device = torch.device("mps")
+    q = torch.randn(batch, heads, seq_len, head_dim, device=device)
+    k = torch.randn(batch, heads, seq_len, head_dim, device=device)
+    v = torch.randn(batch, heads, seq_len, head_dim, device=device)
+    scale = head_dim**-0.5
+
+    def fn(query, key, value):
+        return (
+            torch.ops.aten._scaled_dot_product_attention_math_for_mps.default(
+                query,
+                key,
+                value,
+                None,
+                0.0,
+                True,
+                None,
+                scale=scale,
+            )
+        )
+
+    eager_out, eager_attn = fn(q, k, v)
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+        compiled_out, compiled_attn = compiled(q, k, v)
 
     torch.testing.assert_close(compiled_out, eager_out)
     torch.testing.assert_close(compiled_attn, eager_attn)
@@ -580,9 +613,6 @@ def test_mlx_backend_slice_tensor():
 
 
 def test_mlx_backend_slice_tensor_dynamic_resize():
-    if not dynamo_config.dynamic_shapes:
-        pytest.skip("dynamic shapes required")
-
     torch.manual_seed(170)
 
     def fn(t):
@@ -639,6 +669,96 @@ def test_mlx_backend_prims_iota():
         compiled_out = compiled()
 
     torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_rms_norm():
+    torch.manual_seed(19)
+
+    class TinyRMS(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(6))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return F.rms_norm(x, (x.shape[-1],), eps=1e-5, weight=self.weight)
+
+    model = TinyRMS()
+    inputs = torch.randn(4, 6)
+    eager = model(inputs)
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(model, backend="inductor", fullgraph=True)
+        compiled_out = compiled(inputs)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_backend_rope():
+    torch.manual_seed(20)
+
+    class RopeModule(nn.Module):
+        def forward(self, x, cos, sin):
+            half = x.shape[-1] // 2
+            tail = x[..., half:]
+            head = x[..., :half]
+            rotated = torch.cat((-tail, head), dim=-1)
+            return (x * cos) + (rotated * sin)
+
+    model = RopeModule()
+    x = torch.randn(2, 3, 4, 8)
+    cos = torch.randn(2, 3, 4, 8)
+    sin = torch.randn(2, 3, 4, 8)
+    eager = model(x, cos, sin)
+
+    with config.patch({"mlx_codegen": True}):
+        compiled = torch.compile(model, backend="inductor", fullgraph=True)
+        compiled_out = compiled(x, cos, sin)
+
+    torch.testing.assert_close(compiled_out, eager)
+
+
+def test_mlx_codegen_emits_source_comments():
+    try:
+        _ = (
+            torch.ops.prims
+        )  # ensure namespace exists before importing MLX codegen
+    except AttributeError:
+        pass
+    from torch._inductor.codegen.mlx import MLXGraphCodegen
+
+    class TinyAdd(nn.Module):
+        def forward(self, x):
+            return torch.ops.aten.add.Tensor(x, x)
+
+    gm = symbolic_trace(TinyAdd())
+    stack = (
+        'File "/tmp/test_module.py", line 123, in forward\n'
+        "    return torch.ops.aten.add.Tensor(x, x)\n"
+    )
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            node.meta["stack_trace"] = stack
+
+    class _DummySizeVars:
+        @staticmethod
+        def size_hint(value):
+            return int(value)
+
+    class _DummyGraphLowering:
+        def __init__(self, gm):
+            self.orig_gm = gm
+            self.sizevars = _DummySizeVars()
+
+        def add_tensor_constant(self, value, name):
+            return name
+
+    codegen = MLXGraphCodegen(_DummyGraphLowering(gm))
+    codegen._emit_function_body()
+    body = codegen._body.getvalue()
+    assert (
+        "# File: /tmp/test_module.py:123 in forward, code: return torch.ops.aten.add.Tensor(x, x)"
+        in body
+    )
 
 
 def test_mlx_backend_le_tensor():

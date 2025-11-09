@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import itertools
+import math
+from collections import defaultdict
 from dataclasses import dataclass
 import operator
 from typing import Any, Dict, Iterable, Optional, Sequence
@@ -8,8 +10,10 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 import sympy
 import torch
 from torch.fx import GraphModule, Node
+from torch.fx.graph import _parse_stack_trace
 
 from ..utils import IndentedBuffer, ValueWithLineMap, normalize_name
+from ..fx_passes.mlx_rms_norm import _mlx_rms_norm_stub
 
 
 @dataclass
@@ -33,8 +37,19 @@ class _OutputSpec:
     alias_input_idx: Optional[int] = None
 
 
+@dataclass
+class _QKVFusionGroup:
+    nodes: list[Node]
+    emitted: bool = False
+
+
 def _extract_tensor_meta(node: Node) -> Optional[_TensorMeta]:
-    meta_val = node.meta.get("val") if hasattr(node, "meta") else None
+    meta = getattr(node, "meta", None)
+    if meta is None:
+        return None
+    meta_val = meta.get("val")
+    if meta_val is None:
+        meta_val = meta.get("tensor_meta")
     if meta_val is None:
         return None
     if isinstance(meta_val, torch.Tensor):
@@ -122,6 +137,11 @@ class MLXGraphCodegen:
         self._additional_mutated_idxs: set[int] = set()
         self._placeholder_nodes: list[Node] = []
         self._mutated_exprs: list[str] = []
+        self._last_stack_summary: Optional[str] = None
+        self._node_list = list(self._gm.graph.nodes)
+        self._node_order = {node: idx for idx, node in enumerate(self._node_list)}
+        self._qkv_group_map: dict[Node, _QKVFusionGroup] = {}
+        self._identify_qkv_fusions()
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -131,6 +151,7 @@ class MLXGraphCodegen:
         """
         Produce a ValueWithLineMap containing Python source that evaluates the FX graph with MLX.
         """
+        self._last_stack_summary = None
         self._emit_function_body()
 
         module = IndentedBuffer()
@@ -260,7 +281,9 @@ class MLXGraphCodegen:
                 dtype_expr = _format_dtype(meta.dtype)
                 device_expr = _format_device(meta.device)
                 module.writeline(f"({index}, {dtype_expr}, {device_expr}),")
-        module.writelines(["]", "", "def call(args):"])
+        module.writelines(["]"])
+
+        module.writelines(["", "def call(args):"])
         with module.indent():
             module.writeline("mx_args = []")
             module.writeline("for _value in args:")
@@ -361,6 +384,7 @@ class MLXGraphCodegen:
             module.writelines(
                 [
                     "import torch",
+                    "import time",
                     "",
                     "def _random_tensor(meta):",
                 ]
@@ -371,11 +395,11 @@ class MLXGraphCodegen:
                         "if meta is None:",
                         "    shape = ()",
                         "    dtype = torch.float32",
-                        '    device = torch.device("cpu")',
+                        '    device = torch.device(\"cpu\")',
                         "else:",
                         "    dtype, device, shape = meta",
                         "    dtype = dtype or torch.float32",
-                        '    device = device or torch.device("cpu")',
+                        '    device = device or torch.device(\"cpu\")',
                         "return torch.randn(shape, dtype=dtype, device=device)",
                     ]
                 )
@@ -386,7 +410,10 @@ class MLXGraphCodegen:
                     "for meta in _INPUT_METAS:",
                     "    args.append(_random_tensor(meta))",
                     "",
+                    "start = time.perf_counter()",
                     "result = call(tuple(args))",
+                    "duration = time.perf_counter() - start",
+                    'print(f\"Call duration: {duration:.3f}s\")',
                     'print("MLX compiled module output shapes:")',
                     "if isinstance(result, tuple):",
                 ]
@@ -453,6 +480,7 @@ class MLXGraphCodegen:
                 if node.op == "output":
                     output_node = node
                 continue
+            self._emit_source_comment(node)
             if node.op == "get_attr":
                 self._emit_get_attr(node)
             elif node.op == "call_function":
@@ -488,7 +516,66 @@ class MLXGraphCodegen:
                 )
             self._mutated_exprs.append(self._values[placeholder_node].name)
 
+        self._emit_source_comment(output_node)
         self._emit_output(output_node)
+
+    def _identify_qkv_fusions(self) -> None:
+        input_to_mm: dict[Node, list[Node]] = defaultdict(list)
+        for node in self._gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target == torch.ops.aten.mm.default
+            ):
+                lhs = self._canonical_linear_input(node.args[0])
+                rhs = node.args[1]
+                if lhs is None or not self._is_qkv_weight(rhs):
+                    continue
+                input_to_mm[lhs].append(node)
+
+        for nodes in input_to_mm.values():
+            if len(nodes) != 3:
+                continue
+            ordered = sorted(nodes, key=lambda n: self._node_order.get(n, 0))
+            group = _QKVFusionGroup(ordered)
+            for node in ordered:
+                self._qkv_group_map[node] = group
+
+    def _canonical_linear_input(self, node: Any) -> Optional[Node]:
+        current = node
+        while isinstance(current, Node):
+            if current.op == "call_function" and current.target in _RESHAPE_INPUT_TARGETS:
+                current = current.args[0]
+                continue
+            break
+        return current if isinstance(current, Node) else None
+
+    def _is_qkv_weight(self, node: Any) -> bool:
+        if not isinstance(node, Node):
+            return False
+        if node.op != "call_function" or node.target != torch.ops.aten.permute.default:
+            return False
+        dims = tuple(node.args[1])
+        if dims != (1, 0) and dims != (0, 1):
+            return False
+        base = node.args[0]
+        return isinstance(base, Node) and base.op == "get_attr"
+
+    def _emit_source_comment(self, node: Optional[Node]) -> None:
+        if node is None:
+            return
+        stack_trace = getattr(node, "stack_trace", None)
+        if not stack_trace and hasattr(node, "meta"):
+            stack_trace = node.meta.get("stack_trace")  # type: ignore[union-attr]
+        if not stack_trace:
+            return
+        parsed = _parse_stack_trace(stack_trace)
+        if parsed is None:
+            return
+        summary = parsed.get_summary_str()
+        if summary == self._last_stack_summary:
+            return
+        self._body.writeline(f"# {summary}")
+        self._last_stack_summary = summary
 
     def _emit_get_attr(self, node: Node) -> None:
         target = node.target
@@ -518,6 +605,14 @@ class MLXGraphCodegen:
             self._emit_unary(node, _UNARY_OPS[target])
         elif target in _ADD_TENSOR_TARGETS or target == _ADD_PACKET:
             self._emit_add_tensor(node)
+        elif target is _mlx_rms_norm_stub:
+            tensor = self._value(node.args[0])
+            weight = self._value(node.args[1])
+            eps_expr = self._format_scalar(node.args[2])
+            expr = f"_mx_fast.rms_norm({tensor}, {weight}, eps={eps_expr})"
+            self._values[node] = self._assign(
+                node, expr, meta=_extract_tensor_meta(node)
+            )
         elif target in _ADD_SCALAR_TARGETS:
             self._emit_add_scalar(node)
         elif target in _BINARY_OPS:
@@ -580,7 +675,12 @@ class MLXGraphCodegen:
         elif target == torch.ops.aten.unsqueeze.default:
             self._emit_unsqueeze(node)
         elif target == torch.ops.aten.mm.default:
-            self._emit_mm(node)
+            if node in self._qkv_group_map:
+                group = self._qkv_group_map[node]
+                if not group.emitted:
+                    self._emit_qkv_group(group)
+            else:
+                self._emit_mm(node)
         elif target in _FMA_TARGETS:
             self._emit_fma(node)
         elif target in _SQUEEZE_TARGETS:
@@ -660,9 +760,9 @@ class MLXGraphCodegen:
                 if idx is not None:
                     self._additional_mutated_idxs.add(idx)
                     self._values[dest] = result
-        elif (
-            target
-            == torch.ops.aten._scaled_dot_product_attention_math_for_mps.default
+        elif target in (
+            torch.ops.aten._scaled_dot_product_attention_math_for_mps.default,
+            torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
         ):
             self._emit_sdpa_mps(node)
         elif target == torch.ops.aten.where.self:
@@ -1061,7 +1161,7 @@ class MLXGraphCodegen:
     def _emit_slice(self, node: Node) -> None:
         tensor = self._value(node.args[0])
         dim = self._to_int(node.args[1])
-        start = self._to_int(node.args[2])
+        start_arg = node.args[2]
         end_arg = node.args[3] if len(node.args) > 3 else None
         step = self._to_int(node.args[4]) if len(node.args) > 4 else 1
 
@@ -1069,6 +1169,7 @@ class MLXGraphCodegen:
             raise MLXCodegenError("MLX slice lowering does not yet support step != 1")
 
         input_meta = self._require_tensor_meta(node.args[0], "slice_input")
+        slice_meta = _extract_tensor_meta(node)
         if input_meta.shape is None:
             raise MLXCodegenError("MLX slice lowering requires concrete rank information")
 
@@ -1087,27 +1188,28 @@ class MLXGraphCodegen:
         dim_size_var = axis_size_vars[dim]
 
         start_idx_var = self._new_var("slice_start_idx")
-        self._body.writeline(f"{start_idx_var} = {start}")
-        if start < 0:
-            self._body.writeline(f"{start_idx_var} = int({dim_size_var}) + ({start})")
+        start_expr = self._format_int_expr(start_arg)
+        self._body.writeline(f"{start_idx_var} = {start_expr}")
+        if isinstance(start_arg, int) and start_arg < 0:
+            self._body.writeline(
+                f"{start_idx_var} = int({dim_size_var}) + ({start_arg})"
+            )
         self._body.writeline(
             f"{start_idx_var} = min(max(int({start_idx_var}), 0), int({dim_size_var}))"
         )
 
-        end_val = (
-            None
-            if end_arg is None
-            else self._to_int(end_arg)
-        )
         end_idx_var = self._new_var("slice_end_idx")
-        if end_val is None or end_val >= _INT64_MAX:
+        if end_arg is None or (
+            isinstance(end_arg, int) and end_arg >= _INT64_MAX
+        ):
             self._body.writeline(f"{end_idx_var} = int({dim_size_var})")
         else:
-            if end_val < 0:
-                base_expr = f"int({dim_size_var}) + ({end_val})"
-            else:
-                base_expr = str(end_val)
-            self._body.writeline(f"{end_idx_var} = {base_expr}")
+            end_expr = self._format_int_expr(end_arg)
+            self._body.writeline(f"{end_idx_var} = {end_expr}")
+            if isinstance(end_arg, int) and end_arg < 0:
+                self._body.writeline(
+                    f"{end_idx_var} = int({dim_size_var}) + ({end_arg})"
+                )
             self._body.writeline(
                 f"{end_idx_var} = min(max(int({end_idx_var}), 0), int({dim_size_var}))"
             )
@@ -1117,9 +1219,12 @@ class MLXGraphCodegen:
             f"{slice_extent_var} = max(int({end_idx_var}) - int({start_idx_var}), 0)"
         )
 
+        def _format_start_literal(values: list[str]) -> str:
+            return "[" + ", ".join(values) + "]"
+
         start_terms = ["0"] * rank
         start_terms[dim] = start_idx_var
-        start_literal = "[" + ", ".join(start_terms) + "]"
+        start_literal = _format_start_literal(start_terms)
         start_array = self._new_var("slice_start")
         self._body.writeline(
             f"{start_array} = mx.array({start_literal}, dtype=mx.int32)"
@@ -1132,8 +1237,9 @@ class MLXGraphCodegen:
         for axis in range(rank):
             if axis == dim:
                 slice_sizes.append(slice_extent_var)
-            else:
-                slice_sizes.append(axis_size_vars[axis])
+                continue
+            size_expr = axis_size_vars[axis]
+            slice_sizes.append(size_expr)
         slice_sizes_literal = "(" + ", ".join(slice_sizes) + ")"
 
         expr = (
@@ -1295,6 +1401,36 @@ class MLXGraphCodegen:
             node, expr, meta=_extract_tensor_meta(node)
         )
 
+    def _emit_qkv_group(self, group: _QKVFusionGroup) -> None:
+        nodes = group.nodes
+        lhs_expr = self._value(nodes[0].args[0])
+        weight_exprs = []
+        for mm_node in nodes:
+            weight_exprs.append(self._value(mm_node.args[1]))
+        weights_tuple = "(" + ", ".join(weight_exprs) + ")"
+
+        concat_var = self._new_var("qkv_weights")
+        self._body.writeline(
+            f"{concat_var} = mx.concatenate({weights_tuple}, axis=1)"
+        )
+
+        fused_var = self._new_var("qkv_linear")
+        self._body.writeline(f"{fused_var} = mx.matmul({lhs_expr}, {concat_var})")
+
+        split_var = self._new_var("qkv_split")
+        self._body.writeline(
+            f"{split_var} = mx.split({fused_var}, {len(nodes)}, axis=-1)"
+        )
+
+        for idx, mm_node in enumerate(nodes):
+            chunk_var = self._new_var("qkv_part")
+            self._body.writeline(f"{chunk_var} = {split_var}[{idx}]")
+            self._values[mm_node] = _MLXValue(
+                chunk_var, _extract_tensor_meta(mm_node)
+            )
+
+        group.emitted = True
+
     def _emit_sdpa_mps(self, node: Node) -> None:
         query_node = node.args[0]
         key_node = node.args[1]
@@ -1327,6 +1463,8 @@ class MLXGraphCodegen:
             if query_meta.dtype is not None
             else "mx.float32"
         )
+
+        needs_probs = self._sdpa_needs_prob(node)
 
         attn_mask_arg = self._get_kwarg_or_pos(node, 3, "attn_mask")
         mask_add_expr: Optional[str] = None
@@ -1365,18 +1503,19 @@ class MLXGraphCodegen:
                 "MLX codegen does not yet support custom dropout masks in SDPA"
             )
 
-        fast_mask_arg = "None"
-        if mask_add_expr is not None:
-            fast_mask_arg = mask_add_expr
+        fast_mask_arg = mask_add_expr if mask_add_expr is not None else "None"
 
         if is_causal:
-            causal_mask = self._build_causal_additive_mask(
-                q_len, k_len, scores_dtype
-            )
             if mask_add_expr is None:
+                if needs_probs:
+                    mask_add_expr = self._build_causal_additive_mask(
+                        q_len, k_len, scores_dtype
+                    )
                 fast_mask_arg = "'causal'"
-                mask_add_expr = causal_mask
             else:
+                causal_mask = self._build_causal_additive_mask(
+                    q_len, k_len, scores_dtype
+                )
                 mask_add_expr = self._combine_masks(mask_add_expr, causal_mask)
                 fast_mask_arg = mask_add_expr
 
@@ -1385,16 +1524,21 @@ class MLXGraphCodegen:
             f"{output_var} = _mx_fast.scaled_dot_product_attention({query_expr}, {key_expr}, {value_expr}, scale={scale_expr}, mask={fast_mask_arg})"
         )
 
-        probs_var = self._emit_sdpa_probs(
-            query_expr,
-            key_expr,
-            scale_expr,
-            mask_add_expr,
-        )
+        if needs_probs:
+            probs_var = self._emit_sdpa_probs(
+                query_expr,
+                key_expr,
+                scale_expr,
+                mask_add_expr,
+            )
 
-        tuple_var = self._new_var("sdpa_result")
-        self._body.writeline(f"{tuple_var} = ({output_var}, {probs_var})")
-        self._values[node] = _MLXValue(tuple_var, None)
+            tuple_var = self._new_var("sdpa_result")
+            self._body.writeline(f"{tuple_var} = ({output_var}, {probs_var})")
+            self._values[node] = _MLXValue(tuple_var, None)
+        else:
+            tuple_var = self._new_var("sdpa_result")
+            self._body.writeline(f"{tuple_var} = ({output_var},)")
+            self._values[node] = _MLXValue(tuple_var, None)
 
     def _emit_sdpa_probs(
         self,
@@ -1477,7 +1621,7 @@ class MLXGraphCodegen:
     ) -> _MLXValue:
         name = self._new_var(normalize_name(node.name or "tmp"))
         self._body.writeline(f"{name} = {expr}")
-        return _MLXValue(name, meta or _extract_tensor_meta(node))
+        return _MLXValue(name, meta or self._get_tensor_meta(node))
 
     def _value(self, arg: Any) -> str:
         if isinstance(arg, Node):
@@ -1498,6 +1642,12 @@ class MLXGraphCodegen:
         if isinstance(value, Node):
             return self._value(value)
         if isinstance(value, (int, float)):
+            if isinstance(value, float):
+                if math.isnan(value):
+                    return "float('nan')"
+                if math.isinf(value):
+                    sign = "-" if value < 0 else ""
+                    return f"float('{sign}inf')"
             return repr(value)
         if isinstance(value, bool):
             return "True" if value else "False"
@@ -1596,8 +1746,15 @@ class MLXGraphCodegen:
         self._converted_constants[target] = name
         return name
 
+    def _get_tensor_meta(self, node: Node) -> Optional[_TensorMeta]:
+        if isinstance(node, Node):
+            cached = self._values.get(node)
+            if cached and cached.meta:
+                return cached.meta
+        return _extract_tensor_meta(node)
+
     def _require_tensor_meta(self, node: Node, context: str) -> _TensorMeta:
-        meta = _extract_tensor_meta(node)
+        meta = self._get_tensor_meta(node)
         if meta is None or meta.shape is None:
             raise MLXCodegenError(
                 f"Missing tensor metadata for {context} in MLX codegen"
@@ -1620,6 +1777,27 @@ class MLXGraphCodegen:
         combined = self._new_var("sdpa_mask_combined")
         self._body.writeline(f"{combined} = ({a_expr}) + ({b_expr})")
         return combined
+
+    def _sdpa_needs_prob(self, node: Node) -> bool:
+        for user in node.users:
+            if user.op == "call_function":
+                target = user.target
+                target_name = getattr(target, "__name__", None)
+                if (
+                    user.args
+                    and user.args[0] is node
+                    and len(user.args) > 1
+                    and user.args[1] == 1
+                    and (
+                        target == operator.getitem
+                        or target_name == "getitem"
+                    )
+                ):
+                    return True
+                if target == operator.getitem or target_name == "getitem":
+                    continue
+            return True
+        return False
 
     def _build_causal_additive_mask(
         self, q_len: int, k_len: int, dtype_expr: str
@@ -1786,6 +1964,20 @@ _SQUEEZE_TARGETS = tuple(
     for op in (
         _maybe_get_aten_op("squeeze"),
         _maybe_get_aten_op("squeeze", "dim"),
+    )
+    if op is not None
+)
+
+_RESHAPE_INPUT_TARGETS = tuple(
+    op
+    for op in (
+        _maybe_get_aten_op("reshape"),
+        _maybe_get_aten_op("reshape", "default"),
+        _maybe_get_aten_op("view"),
+        _maybe_get_aten_op("view", "default"),
+        _maybe_get_aten_op("_unsafe_view"),
+        _maybe_get_aten_op("_unsafe_view", "default"),
+        _maybe_get_aten_op("contiguous"),
     )
     if op is not None
 )
